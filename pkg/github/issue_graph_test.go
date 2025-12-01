@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"net/http"
+	"strings"
 	"testing"
 	"time"
 
@@ -415,9 +416,9 @@ func TestIssueGraphWithSubIssues(t *testing.T) {
 				path := r.URL.Path
 				var issue *github.Issue
 				switch {
-				case contains(path, "/101"):
+				case strings.Contains(path, "/101"):
 					issue = subIssue1
-				case contains(path, "/102"):
+				case strings.Contains(path, "/102"):
 					issue = subIssue2
 				default:
 					issue = parentIssue
@@ -432,7 +433,7 @@ func TestIssueGraphWithSubIssues(t *testing.T) {
 				requestCount++
 				// Return sub-issues only for the parent issue
 				path := r.URL.Path
-				if contains(path, "/100/") {
+				if strings.Contains(path, "/100/") {
 					w.WriteHeader(http.StatusOK)
 					_, _ = w.Write([]byte(subIssuesJSON))
 				} else {
@@ -469,18 +470,4 @@ func TestIssueGraphWithSubIssues(t *testing.T) {
 	textContent := getTextResult(t, result)
 	assert.Contains(t, textContent.Text, "#100")
 	assert.Contains(t, textContent.Text, "Parent Issue")
-}
-
-// Helper function to check if path contains substring
-func contains(s, substr string) bool {
-	return len(s) >= len(substr) && (s == substr || len(s) > 0 && containsSubstr(s, substr))
-}
-
-func containsSubstr(s, substr string) bool {
-	for i := 0; i <= len(s)-len(substr); i++ {
-		if s[i:i+len(substr)] == substr {
-			return true
-		}
-	}
-	return false
 }

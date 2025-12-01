@@ -18,7 +18,6 @@ import (
 
 const (
 	// MaxGraphDepth is the maximum depth to crawl for related issues
-	// Reduced to 3 for performance (can be increased in future versions)
 	MaxGraphDepth = 3
 	// MaxConcurrentFetches is the maximum number of concurrent API calls
 	MaxConcurrentFetches = 5
@@ -449,6 +448,7 @@ func (gc *graphCrawler) crawl(ctx context.Context) error {
 		current := queue[0]
 		queue = queue[1:]
 
+		// Skip if beyond max depth (shouldn't happen, but defensive check)
 		if current.depth > MaxGraphDepth {
 			continue
 		}
@@ -477,8 +477,8 @@ func (gc *graphCrawler) crawl(ctx context.Context) error {
 			continue
 		}
 
-		// Don't crawl further if at max depth
-		if current.depth >= MaxGraphDepth {
+		// Don't crawl further from nodes at max depth (they are leaf nodes for crawling)
+		if current.depth == MaxGraphDepth {
 			continue
 		}
 
@@ -541,9 +541,6 @@ func (gc *graphCrawler) crawl(ctx context.Context) error {
 						continue
 					}
 					subNumber := *subIssue.Number
-					if subNumber == 0 {
-						continue
-					}
 					subKey := nodeKey(current.owner, current.repo, subNumber)
 
 					// This node is parent of sub-issue
@@ -802,7 +799,13 @@ The graph shows:
 - Parent/child relationships from sub-issues and "closes/fixes" references
 - Related issues mentioned in bodies
 
-Call this tool early when working on an issue to gather appropriate context about the work hierarchy.`)),
+Call this tool early when working on an issue to gather appropriate context about the work hierarchy.
+
+Works well with:
+- issue_read: After using issue_graph to identify important related issues, use issue_read to get full details of specific issues
+- pull_request_read: Use to get full PR details for PRs identified in the graph
+- search_issues: If the graph reveals related work areas, search for more issues in those areas
+- list_issues: List all issues in the repository to find additional context not captured in the graph`)),
 			mcp.WithToolAnnotation(mcp.ToolAnnotation{
 				Title:        t("TOOL_ISSUE_GRAPH_USER_TITLE", "Get issue relationship graph"),
 				ReadOnlyHint: ToBoolPtr(true),
