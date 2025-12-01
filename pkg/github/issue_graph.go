@@ -8,6 +8,7 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/github/github-mcp-server/pkg/lockdown"
 	"github.com/github/github-mcp-server/pkg/translations"
@@ -314,20 +315,21 @@ func (gc *graphCrawler) markRepoInaccessible(owner, repo string) {
 }
 
 // fetchNode fetches a single issue or PR and adds it to the graph
-func (gc *graphCrawler) fetchNode(ctx context.Context, owner, repo string, number, depth int) (*GraphNode, error) {
+// Returns both the node and the raw issue for further processing
+func (gc *graphCrawler) fetchNode(ctx context.Context, owner, repo string, number, depth int) (*GraphNode, *github.Issue, error) {
 	key := nodeKey(owner, repo, number)
 
 	// Check if already visited
 	gc.mu.RLock()
 	if node, exists := gc.nodes[key]; exists {
 		gc.mu.RUnlock()
-		return node, nil
+		return node, nil, nil // Already visited, no issue to return
 	}
 	gc.mu.RUnlock()
 
 	// Check if repo is known to be inaccessible
 	if gc.isRepoInaccessible(owner, repo) {
-		return nil, nil
+		return nil, nil, nil
 	}
 
 	// Acquire semaphore
@@ -335,7 +337,7 @@ func (gc *graphCrawler) fetchNode(ctx context.Context, owner, repo string, numbe
 	case gc.sem <- struct{}{}:
 		defer func() { <-gc.sem }()
 	case <-ctx.Done():
-		return nil, ctx.Err()
+		return nil, nil, ctx.Err()
 	}
 
 	// Fetch issue/PR details
@@ -350,10 +352,10 @@ func (gc *graphCrawler) fetchNode(ctx context.Context, owner, repo string, numbe
 				if resp.StatusCode == 403 {
 					gc.markRepoInaccessible(owner, repo)
 				}
-				return nil, nil
+				return nil, nil, nil
 			}
 		}
-		return nil, fmt.Errorf("failed to get issue %s: %w", key, err)
+		return nil, nil, fmt.Errorf("failed to get issue %s: %w", key, err)
 	}
 	defer func() { _ = resp.Body.Close() }()
 
@@ -364,11 +366,11 @@ func (gc *graphCrawler) fetchNode(ctx context.Context, owner, repo string, numbe
 			isSafeContent, err := gc.cache.IsSafeContent(ctx, login, owner, repo)
 			if err != nil {
 				// Skip this node if we can't verify safety
-				return nil, nil
+				return nil, nil, nil
 			}
 			if !isSafeContent {
 				// Content is restricted, skip but don't fail
-				return nil, nil
+				return nil, nil, nil
 			}
 		}
 	}
@@ -421,7 +423,7 @@ func (gc *graphCrawler) fetchNode(ctx context.Context, owner, repo string, numbe
 	gc.nodes[key] = node
 	gc.mu.Unlock()
 
-	return node, nil
+	return node, issue, nil
 }
 
 // crawl performs a BFS crawl from the focus node
@@ -467,8 +469,8 @@ func (gc *graphCrawler) crawl(ctx context.Context) error {
 			continue
 		}
 
-		// Fetch the node
-		node, err := gc.fetchNode(ctx, current.owner, current.repo, current.number, current.depth)
+		// Fetch the node and the raw issue data
+		node, issue, err := gc.fetchNode(ctx, current.owner, current.repo, current.number, current.depth)
 		if err != nil {
 			// Log error but continue crawling
 			continue
@@ -478,17 +480,9 @@ func (gc *graphCrawler) crawl(ctx context.Context) error {
 		}
 
 		// Don't crawl further from nodes at max depth (they are leaf nodes for crawling)
-		if current.depth == MaxGraphDepth {
+		// Also skip if we didn't get issue data (already visited node)
+		if current.depth == MaxGraphDepth || issue == nil {
 			continue
-		}
-
-		// Get issue again to extract references (we need the full body)
-		issue, resp, err := gc.client.Issues.Get(ctx, current.owner, current.repo, current.number)
-		if err != nil {
-			continue
-		}
-		if resp != nil {
-			_ = resp.Body.Close()
 		}
 
 		bodyRefs := extractIssueReferences(issue.GetBody(), current.owner, current.repo)
@@ -757,6 +751,18 @@ func formatGraphOutput(graph *IssueGraph) string {
 		switch edge.Relation {
 		case RelationTypeChild:
 			parentChildEdges = append(parentChildEdges, edge)
+		case RelationTypeParent:
+			// Parent edges: from closes ref, so ref is parent of from
+			// Reverse the direction for display: parent → child
+			parentChildEdges = append(parentChildEdges, GraphEdge{
+				FromOwner:  edge.ToOwner,
+				FromRepo:   edge.ToRepo,
+				FromNumber: edge.ToNumber,
+				ToOwner:    edge.FromOwner,
+				ToRepo:     edge.FromRepo,
+				ToNumber:   edge.FromNumber,
+				Relation:   RelationTypeChild,
+			})
 		case RelationTypeRelated:
 			relatedEdges = append(relatedEdges, edge)
 		}
@@ -799,13 +805,7 @@ The graph shows:
 - Parent/child relationships from sub-issues and "closes/fixes" references
 - Related issues mentioned in bodies
 
-Call this tool early when working on an issue to gather appropriate context about the work hierarchy.
-
-Works well with:
-- issue_read: After using issue_graph to identify important related issues, use issue_read to get full details of specific issues
-- pull_request_read: Use to get full PR details for PRs identified in the graph
-- search_issues: If the graph reveals related work areas, search for more issues in those areas
-- list_issues: List all issues in the repository to find additional context not captured in the graph`)),
+Call this tool early when working on an issue to gather appropriate context about the work hierarchy.`)),
 			mcp.WithToolAnnotation(mcp.ToolAnnotation{
 				Title:        t("TOOL_ISSUE_GRAPH_USER_TITLE", "Get issue relationship graph"),
 				ReadOnlyHint: ToBoolPtr(true),
@@ -842,10 +842,17 @@ Works well with:
 				return nil, fmt.Errorf("failed to get GitHub client: %w", err)
 			}
 
+			// Add timeout to prevent runaway crawling
+			crawlCtx, cancel := context.WithTimeout(ctx, 7*time.Second)
+			defer cancel()
+
 			// Create crawler and build graph
 			crawler := newGraphCrawler(client, cache, flags, owner, repo, issueNumber)
-			if err := crawler.crawl(ctx); err != nil {
-				return nil, fmt.Errorf("failed to crawl issue graph: %w", err)
+			if err := crawler.crawl(crawlCtx); err != nil {
+				// If timeout, continue with partial results; otherwise fail
+				if crawlCtx.Err() != context.DeadlineExceeded {
+					return nil, fmt.Errorf("failed to crawl issue graph: %w", err)
+				}
 			}
 
 			graph := crawler.buildGraph()
