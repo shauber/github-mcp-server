@@ -76,6 +76,52 @@ var (
 			return ghmcp.RunStdioServer(stdioServerConfig)
 		},
 	}
+
+	httpCmd = &cobra.Command{
+		Use:   "http",
+		Short: "Start HTTP server with SSE transport",
+		Long:  `Start a server that communicates via HTTP using Server-Sent Events (SSE) for the MCP protocol.`,
+		RunE: func(_ *cobra.Command, _ []string) error {
+			token := viper.GetString("personal_access_token")
+			if token == "" {
+				return errors.New("GITHUB_PERSONAL_ACCESS_TOKEN not set")
+			}
+
+			var enabledToolsets []string
+			if err := viper.UnmarshalKey("toolsets", &enabledToolsets); err != nil {
+				return fmt.Errorf("failed to unmarshal toolsets: %w", err)
+			}
+
+			var enabledTools []string
+			if err := viper.UnmarshalKey("tools", &enabledTools); err != nil {
+				return fmt.Errorf("failed to unmarshal tools: %w", err)
+			}
+
+			// If neither toolset config nor tools config is passed we enable the default toolset
+			if len(enabledToolsets) == 0 && len(enabledTools) == 0 {
+				enabledToolsets = []string{github.ToolsetMetadataDefault.ID}
+			}
+
+			ttl := viper.GetDuration("repo-access-cache-ttl")
+			httpServerConfig := ghmcp.HTTPServerConfig{
+				Version:            version,
+				Host:               viper.GetString("host"),
+				Token:              token,
+				EnabledToolsets:    enabledToolsets,
+				EnabledTools:       enabledTools,
+				DynamicToolsets:    viper.GetBool("dynamic_toolsets"),
+				ReadOnly:           viper.GetBool("read-only"),
+				ExportTranslations: viper.GetBool("export-translations"),
+				LogFilePath:        viper.GetString("log-file"),
+				ContentWindowSize:  viper.GetInt("content-window-size"),
+				LockdownMode:       viper.GetBool("lockdown-mode"),
+				RepoAccessCacheTTL: &ttl,
+				Port:               viper.GetInt("port"),
+				BindAddress:        viper.GetString("bind"),
+			}
+			return ghmcp.RunHTTPServer(httpServerConfig)
+		},
+	}
 )
 
 func init() {
@@ -110,8 +156,15 @@ func init() {
 	_ = viper.BindPFlag("lockdown-mode", rootCmd.PersistentFlags().Lookup("lockdown-mode"))
 	_ = viper.BindPFlag("repo-access-cache-ttl", rootCmd.PersistentFlags().Lookup("repo-access-cache-ttl"))
 
+	// HTTP command specific flags
+	httpCmd.Flags().Int("port", 8080, "Port to listen on")
+	httpCmd.Flags().String("bind", "127.0.0.1", "Address to bind to (use 0.0.0.0 for all interfaces)")
+	_ = viper.BindPFlag("port", httpCmd.Flags().Lookup("port"))
+	_ = viper.BindPFlag("bind", httpCmd.Flags().Lookup("bind"))
+
 	// Add subcommands
 	rootCmd.AddCommand(stdioCmd)
+	rootCmd.AddCommand(httpCmd)
 }
 
 func initConfig() {

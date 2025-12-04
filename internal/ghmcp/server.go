@@ -323,6 +323,144 @@ func RunStdioServer(cfg StdioServerConfig) error {
 	return nil
 }
 
+type HTTPServerConfig struct {
+	// Version of the server
+	Version string
+
+	// GitHub Host to target for API requests (e.g. github.com or github.enterprise.com)
+	Host string
+
+	// GitHub Token to authenticate with the GitHub API
+	Token string
+
+	// EnabledToolsets is a list of toolsets to enable
+	EnabledToolsets []string
+
+	// EnabledTools is a list of specific tools to enable (additive to toolsets)
+	EnabledTools []string
+
+	// Whether to enable dynamic toolsets
+	DynamicToolsets bool
+
+	// ReadOnly indicates if we should only register read-only tools
+	ReadOnly bool
+
+	// ExportTranslations indicates if we should export translations
+	ExportTranslations bool
+
+	// Path to the log file if not stderr
+	LogFilePath string
+
+	// Content window size
+	ContentWindowSize int
+
+	// LockdownMode indicates if we should enable lockdown mode
+	LockdownMode bool
+
+	// RepoAccessCacheTTL overrides the default TTL for repository access cache entries.
+	RepoAccessCacheTTL *time.Duration
+
+	// Port to listen on
+	Port int
+
+	// BindAddress is the address to bind to (e.g., "127.0.0.1" or "0.0.0.0")
+	BindAddress string
+}
+
+// RunHTTPServer starts an HTTP server with SSE transport for MCP.
+func RunHTTPServer(cfg HTTPServerConfig) error {
+	// Create app context
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+
+	t, dumpTranslations := translations.TranslationHelper()
+
+	var slogHandler slog.Handler
+	var logOutput io.Writer
+	if cfg.LogFilePath != "" {
+		file, err := os.OpenFile(cfg.LogFilePath, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0600)
+		if err != nil {
+			return fmt.Errorf("failed to open log file: %w", err)
+		}
+		defer file.Close()
+		logOutput = file
+		slogHandler = slog.NewTextHandler(logOutput, &slog.HandlerOptions{Level: slog.LevelDebug})
+	} else {
+		logOutput = os.Stderr
+		slogHandler = slog.NewTextHandler(logOutput, &slog.HandlerOptions{Level: slog.LevelInfo})
+	}
+	logger := slog.New(slogHandler)
+	logger.Info("starting HTTP server", "version", cfg.Version, "host", cfg.Host, "port", cfg.Port, "bind", cfg.BindAddress, "dynamicToolsets", cfg.DynamicToolsets, "readOnly", cfg.ReadOnly, "lockdownEnabled", cfg.LockdownMode)
+
+	if cfg.ExportTranslations {
+		// Once server is initialized, all translations are loaded
+		dumpTranslations()
+	}
+
+	// Create the SSE handler
+	handler := mcp.NewSSEHandler(func(req *http.Request) *mcp.Server {
+		// Create a new MCP server for each connection
+		ghServer, err := NewMCPServer(MCPServerConfig{
+			Version:           cfg.Version,
+			Host:              cfg.Host,
+			Token:             cfg.Token,
+			EnabledToolsets:   cfg.EnabledToolsets,
+			EnabledTools:      cfg.EnabledTools,
+			DynamicToolsets:   cfg.DynamicToolsets,
+			ReadOnly:          cfg.ReadOnly,
+			Translator:        t,
+			ContentWindowSize: cfg.ContentWindowSize,
+			LockdownMode:      cfg.LockdownMode,
+			Logger:            logger,
+			RepoAccessTTL:     cfg.RepoAccessCacheTTL,
+		})
+		if err != nil {
+			logger.Error("failed to create MCP server", "error", err)
+			return nil
+		}
+		return ghServer
+	}, nil)
+
+	// Create HTTP server
+	addr := fmt.Sprintf("%s:%d", cfg.BindAddress, cfg.Port)
+	httpServer := &http.Server{
+		Addr:    addr,
+		Handler: handler,
+	}
+
+	// Start listening for connections
+	errC := make(chan error, 1)
+	go func() {
+		logger.Info("HTTP server listening", "address", addr)
+		if err := httpServer.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+			errC <- fmt.Errorf("HTTP server error: %w", err)
+		}
+	}()
+
+	// Output startup message
+	_, _ = fmt.Fprintf(os.Stderr, "GitHub MCP Server running on http://%s\n", addr)
+
+	// Wait for shutdown signal
+	select {
+	case <-ctx.Done():
+		logger.Info("shutting down HTTP server", "signal", "context done")
+		// Graceful shutdown
+		shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		if err := httpServer.Shutdown(shutdownCtx); err != nil {
+			logger.Error("error during HTTP server shutdown", "error", err)
+			return fmt.Errorf("error during HTTP server shutdown: %w", err)
+		}
+	case err := <-errC:
+		if err != nil {
+			logger.Error("HTTP server error", "error", err)
+			return err
+		}
+	}
+
+	return nil
+}
+
 type apiHost struct {
 	baseRESTURL *url.URL
 	graphqlURL  *url.URL
